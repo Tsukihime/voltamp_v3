@@ -3,6 +3,7 @@
 #include <util/atomic.h>
 
 #include "Bluetooth.h"
+#include "ScpiParser.h"
 #include "utils.h"
 #include "lib/usart0.hpp"
 #include "lib/AVRPin.hpp"
@@ -16,6 +17,10 @@ ISR(USART_TXC_vect) {
     Bluetooth::ISRTransmitComplete();
 }
 
+ISR(USART_RXC_vect) {
+    ScpiParser::handleByte(UDR);
+}
+
 inline bool isTransmitAllowed() {
     return BT_STATE::IsSet();
 }
@@ -27,10 +32,11 @@ void Bluetooth::initialize(void) {
                  Usart0::DataBits8 |
                  Usart0::NoneParity |
                  Usart0::OneStopBit |
-                 Usart0::TxEnable)
+                 Usart0::RxTxEnable)
                  );
 
     Usart0::EnableInterrupt(Usart0::TxCompleteInt);
+    Usart0::EnableInterrupt(Usart0::RxNotEmptyInt);
 
     transmitActive = false;
 }

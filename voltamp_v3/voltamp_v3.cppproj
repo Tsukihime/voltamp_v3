@@ -46,15 +46,15 @@
     <avrtoolinterface />
     <AsfFrameworkConfig>
       <framework-data xmlns="">
-  <options />
-  <configurations />
-  <files />
-  <documentation help="" />
-  <offline-documentation help="" />
-  <dependencies>
-    <content-extension eid="atmel.asf" uuidref="Atmel.ASF" version="3.49.1" />
-  </dependencies>
-</framework-data>
+        <options />
+        <configurations />
+        <files />
+        <documentation help="" />
+        <offline-documentation help="" />
+        <dependencies>
+          <content-extension eid="atmel.asf" uuidref="Atmel.ASF" version="3.49.1" />
+        </dependencies>
+      </framework-data>
     </AsfFrameworkConfig>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)' == 'Release' ">
@@ -263,6 +263,12 @@
       <SubType>compile</SubType>
     </Compile>
     <Compile Include="PowerSupplier.h">
+      <SubType>compile</SubType>
+    </Compile>
+    <Compile Include="ScpiParser.cpp">
+      <SubType>compile</SubType>
+    </Compile>
+    <Compile Include="ScpiParser.h">
       <SubType>compile</SubType>
     </Compile>
     <Compile Include="screen\MainScreen.cpp">

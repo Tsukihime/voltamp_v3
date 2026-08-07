@@ -71,22 +71,6 @@ void updateState() {
     MainScreen::setVoltageLimit(PowerSupplier::getVoltage());
     MainScreen::setCurrentLimit(PowerSupplier::getCurrent());
 
-	printValue("V:", voltage);
-	printValue(" C:", current);
-	printValue(" P:", power);
-	printValue(" E:", energyMilliWattHour);
-	printValue(" VSet:", PowerSupplier::getVoltage());
-	printValue(" CSet:", PowerSupplier::getCurrent());
-
-	printValue(" VRaw:", Multimeter::getRawVoltage());
-	printValue(" CRaw:", Multimeter::getRawCurrent());
-	printValue(" VRawSet:", PowerSupplier::getRawVoltage());
-	printValue(" CRawSet:", PowerSupplier::getRawCurrent());
-
-	printValue(" CC:", Buttons::isConstantCurrentMode() ? 1 : 0);
-	printValue(" ON:", Buttons::isOutputSwitchOn() ? 1 : 0);
-
-    Bluetooth::sendString("\r\n");
     Scheduler::setTimer(updateState, 8);
 }
 
