@@ -74,5 +74,7 @@ inline void bcd2ascii(uint8_t ints[5]) {
 }
 
 uint8_t int32ToStrFixedPoint(int32_t value, char buffer[13], uint8_t point_position = 0);
+int32_t fastatoi(const char *b);
+int32_t str_to_fixedpoint(char *s, int16_t target_exp);
 
 #endif /* UTILS_H_ */

@@ -10,7 +10,7 @@
 
 using BT_STATE = Pd2;
 
-RingBuffer<UART_SEND_BUFFER_SIZE> Bluetooth::sendBuffer;
+RingBuffer<UART_BUFFER_SIZE> Bluetooth::sendBuffer;
 volatile bool Bluetooth::transmitActive;
 
 ISR(USART_TXC_vect) {
@@ -18,7 +18,7 @@ ISR(USART_TXC_vect) {
 }
 
 ISR(USART_RXC_vect) {
-    ScpiParser::handleByte(UDR);
+    ScpiParser::ISRReceivedByte(UDR);
 }
 
 inline bool isTransmitAllowed() {

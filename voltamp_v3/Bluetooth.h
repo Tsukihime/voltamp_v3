@@ -5,7 +5,7 @@
 #include "lib/RingBuffer.hpp"
 
 const uint32_t UART_BAUDRATE = 9600;
-const uint8_t UART_SEND_BUFFER_SIZE = 64;
+const uint8_t UART_BUFFER_SIZE = 64;
 
 extern "C" void USART_TXC_vect(void) __attribute__((signal));
 
@@ -13,7 +13,7 @@ class Bluetooth {
     friend void USART_TXC_vect();
 
     private:
-        static RingBuffer<UART_SEND_BUFFER_SIZE> sendBuffer;
+        static RingBuffer<UART_BUFFER_SIZE> sendBuffer;
         static volatile bool transmitActive;
 
         static inline void startTransmit();
