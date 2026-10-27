@@ -73,7 +73,7 @@ void calibrate() {
 
     switch (state) {
         case 0:
-            value = 100;
+            value = 132;
             initScreen();
             drawHeader("SET 1.00 VOLT     ");
             OUT_EN::SetDirWrite();
@@ -94,7 +94,7 @@ void calibrate() {
             }
             break;
         case 2:
-            value = 2300;
+            value = 2083;
             drawHeader("SET 17.00 VOLTS   ");
             VoltageSelector::setVoltageLevel(2);
             state = 3;
@@ -112,7 +112,7 @@ void calibrate() {
             }
             break;
         case 4:
-            value = 100;
+            value = 132;
             VoltageSelector::setVoltageLevel(0);
             drawHeader("SET 0.100 AMPERES ");
             state = 5;
@@ -130,7 +130,7 @@ void calibrate() {
             }
             break;
         case 6:
-            value = 2300;
+            value = 2070;
             drawHeader("SET 1.700 AMPERES ");
             state = 7;
             break;
