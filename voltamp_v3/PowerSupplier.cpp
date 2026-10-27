@@ -8,6 +8,8 @@
 
 uint16_t PowerSupplier::voltage_mv = 0;
 uint16_t PowerSupplier::current_ma = 0;
+int16_t PowerSupplier::current_correction_ma = 0;
+int16_t PowerSupplier::voltage_correction_mv = 0;
 uint16_t PowerSupplier::voltageDacValue;
 uint16_t PowerSupplier::currentDacValue;
 
@@ -56,8 +58,8 @@ void PowerSupplier::setDacValues() {
         VoltageSelector::setVoltageLevel(3);
     }
 
-    voltageDacValue = Settings::normalizePowerSupplierVoltage(voltage_mv);
-    currentDacValue = Settings::normalizePowerSupplierCurrent(current_ma);
+    voltageDacValue = Settings::normalizePowerSupplierVoltage(voltage_mv + voltage_correction_mv);
+    currentDacValue = Settings::normalizePowerSupplierCurrent(current_ma + current_correction_ma);
 
     Dac::setValues(voltageDacValue, currentDacValue);
 }
@@ -80,10 +82,28 @@ void PowerSupplier::setCurrent(uint16_t current_ma) {
     setDacValues();
 }
 
+void PowerSupplier::setCurrentCorrection(int16_t correction_ma) {
+    current_correction_ma = correction_ma;
+    setDacValues();
+}
+
+void PowerSupplier::setVoltageCorrection(int16_t correction_mv) {
+    voltage_correction_mv = correction_mv;
+    setDacValues();
+}
+
 uint16_t PowerSupplier::getVoltage() {
     return voltage_mv;
 }
 
 uint16_t PowerSupplier::getCurrent() {
     return current_ma;
+}
+
+int16_t PowerSupplier::getCurrentCorrection() {
+    return current_correction_ma;
+}
+
+int16_t PowerSupplier::getVoltageCorrection() {
+    return voltage_correction_mv;
 }

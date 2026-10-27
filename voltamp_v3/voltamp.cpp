@@ -20,13 +20,6 @@ extern "C" {
     #include "lib/i2cmaster.h"
 }
 
-void printValue(const char * title, int32_t value) {
-    char digits[13];
-	int32ToStrFixedPoint(value, digits);
-	Bluetooth::sendString(title);
-    Bluetooth::sendString(digits);
-}
-
 uint32_t energyMicroWattHour = 0;
 void updateEnergyCounter() {
     int32_t voltage = Multimeter::getVoltage();
@@ -72,6 +65,52 @@ void updateState() {
     MainScreen::setCurrentLimit(PowerSupplier::getCurrent());
 
     Scheduler::setTimer(updateState, 8);
+}
+
+void correctOutput() {
+    bool cc = Buttons::isConstantCurrentMode();
+
+    if (!cc) {
+        // Disable current correction outside CC mode.
+        // The op-amp temperature and its resulting input offset drift
+        // are unknown, so applying a correction could increase the error.
+        PowerSupplier::setCurrentCorrection(0);
+
+        // Compensate for the difference between the measured output voltage
+        // and the voltage setpoint, accounting for the existing correction.
+        int16_t voltage = Multimeter::getVoltage();
+        int16_t voltageLimit = PowerSupplier::getVoltage();
+        int16_t error = voltageLimit - voltage;
+        
+        // Ignore deviations within +/-1 mV to prevent DAC hunting.
+        if (abs(error) <= 1) return;
+        
+        int16_t correction = error + PowerSupplier::getVoltageCorrection();
+        
+        // Limit the total voltage correction to +/-100 mV.
+        correction = clamp(correction, -100, 100);
+
+        PowerSupplier::setVoltageCorrection(correction);
+    } else {
+        // Disable voltage correction while operating in CC mode.
+        PowerSupplier::setVoltageCorrection(0);
+
+        // In CC mode, the difference between the measured current and
+        // the setpoint is used to compensate for thermal offset drift.
+        // This function runs every 2 seconds to reduce oscillations.
+        int16_t current = Multimeter::getCurrent();
+        int16_t currentLimit = PowerSupplier::getCurrent();
+        int16_t error = currentLimit - current;
+        
+        // Ignore deviations within +/-1 mA to prevent DAC hunting.
+        if (abs(error) <= 1) return;
+        
+        int16_t correction = error + PowerSupplier::getCurrentCorrection();
+        // Limit the total current correction to +/-100 mA.
+        correction = clamp(correction, -100, 100);
+
+        PowerSupplier::setCurrentCorrection(correction);
+    }
 }
 
 void updateEncoderButtons() {
@@ -161,6 +200,7 @@ int main(void) {
         Scheduler::setTimer(updateEncoders, 10, true);
         Scheduler::setTimer(updateState, 1);
         Scheduler::setTimer(updateSettings, 1000, true);
+        Scheduler::setTimer(correctOutput, 200, true);
 
         PowerSupplier::setCurrent(Settings::getCurrent());
         PowerSupplier::setVoltage(Settings::getVoltage());
