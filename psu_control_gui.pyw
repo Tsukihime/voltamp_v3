@@ -16,6 +16,13 @@ from tkinter import messagebox, ttk
 import serial
 from serial.tools import list_ports
 
+# Pillow provides antialiased switch artwork. The rest of the GUI still works
+# without it (with a simpler native Tk Canvas drawing instead).
+try:
+    from PIL import Image, ImageDraw, ImageTk
+except ImportError:
+    Image = ImageDraw = ImageTk = None
+
 DEFAULT_PORT = 'COM4'
 DEFAULT_BAUDRATE = 9600
 CONFIG_FILE = Path(__file__).resolve().with_name('psu_control_gui.ini')
@@ -129,13 +136,14 @@ class App(tk.Tk):
         self.worker = None
         self.connected = False
         self.status = tk.StringVar(value='Disconnected')
-        self.output = tk.StringVar(value='OUTPUT: ?')
+        self.output = tk.StringVar(value='OUTPUT')
         self.mode = tk.StringVar(value='MODE: ?')
         self.connection_info = tk.StringVar()
         self.values = {}
         self.adc_labels = {}
         self.mode_bars = {}
         self.controls = {}
+        self.output_actual = None  # None until a valid OUTP? response is received.
 
         self.make_ui()
         # Accommodate Windows display scaling and font metrics without clipping
@@ -225,16 +233,98 @@ class App(tk.Tk):
             3, 3, 17, 17, fill='#475569', outline='#64748b')
         self.label(bottom, textvariable=self.mode, size=13,
                    color='#e2e8f0').pack(side='left', padx=(0, 8))
+        # OUTPUT is a single two-position switch. Its state is driven by
+        # OUTP? replies, so changes made on the PSU itself are also reflected.
+        self.output_switch = tk.Canvas(bottom, width=88, height=36, bg=BG,
+                                       highlightthickness=0, bd=0,
+                                       relief='flat', takefocus=0,
+                                       cursor='arrow')
+        # Keep PhotoImage references alive, and reuse each generated bitmap.
+        self._switch_images = {}
+        self.output_switch.pack(side='right', padx=(4, 8))
+        self.output_switch.bind('<Button-1>', self.toggle_output)
         self.label(bottom, textvariable=self.output, size=13,
-                   color='#e2e8f0').pack(side='left', padx=20)
-        tk.Button(bottom, text='OUTPUT ON', command=lambda: self.send('OUTP 1'),
-                  bg='#15803d', fg='white', relief='flat', padx=16,
-                  pady=7).pack(side='right', padx=4)
-        tk.Button(bottom, text='OUTPUT OFF', command=lambda: self.send('OUTP 0'),
-                  bg='#b91c1c', fg='white', relief='flat', padx=16,
-                  pady=7).pack(side='right', padx=4)
+                   color='#e2e8f0').pack(side='right', padx=(8, 4))
+        self.render_output_switch()
 
         self.refresh_connection_info()
+
+    @staticmethod
+    def _make_switch_image(enabled, track_color):
+        """Draw a simple, centered switch with anti-aliased edges."""
+        scale = 4
+        width, height = 88, 36
+        image = Image.new('RGB', (width * scale, height * scale), BG)
+        draw = ImageDraw.Draw(image)
+
+        def rect(coords):
+            return tuple(round(c * scale) for c in coords)
+
+        # One clean pill (no shadow or accent arc above the track).
+        draw.rounded_rectangle(rect((3, 3, 85, 33)), radius=15 * scale,
+                               fill=track_color, outline='#64748b' if not enabled
+                               else '#16a34a', width=scale)
+
+        # Both the knob and the track are centered at y=18. The knob has
+        # symmetrical clearance above and below the track (2 px each).
+        knob_left = 56 if enabled else 6
+        draw.ellipse(rect((knob_left, 5, knob_left + 26, 31)),
+                     fill='#f8fafc', outline='#cbd5e1', width=scale)
+
+        return ImageTk.PhotoImage(
+            image.resize((width, height), Image.Resampling.LANCZOS)
+        )
+
+    def render_output_switch(self):
+        """Display the current local state (refreshed by each OUTP? reply)."""
+        widget = self.output_switch
+        widget.delete('all')
+        if self.connected and self.output_actual is not None:
+            visual_on = self.output_actual
+            color = '#15803d' if visual_on else '#475569'
+            caption = 'ON' if visual_on else 'OFF'
+            key = 'on' if visual_on else 'off'
+        else:
+            visual_on = False
+            color, caption = '#334155', '?'
+            key = 'unknown'
+
+        if Image is not None:
+            if key not in self._switch_images:
+                self._switch_images[key] = self._make_switch_image(visual_on, color)
+            widget.create_image(0, 0, image=self._switch_images[key], anchor='nw')
+        else:
+            # Native Canvas fallback with the same centered geometry.
+            widget.create_oval(3, 3, 33, 33, fill=color, outline=color)
+            widget.create_rectangle(18, 3, 70, 33, fill=color, outline=color)
+            widget.create_oval(55, 3, 85, 33, fill=color, outline=color)
+            knob_left = 56 if visual_on else 6
+            widget.create_oval(knob_left, 5, knob_left + 26, 31,
+                               fill='#f8fafc', outline='#cbd5e1')
+
+        widget.create_text(24 if visual_on else 64, 18, text=caption,
+                           fill='#ffffff', font=('Segoe UI', 9, 'bold'))
+        widget.configure(cursor='hand2' if self.connected and
+                         self.output_actual is not None else 'arrow')
+
+    def toggle_output(self, _event=None):
+        # Flip immediately; let the next normal OUTP? update reconcile with
+        # the physical PSU state if the command was ignored or failed.
+        if not self.connected or self.output_actual is None:
+            return
+        self.output_actual = not self.output_actual
+        self.render_output_switch()
+        self.commands.put(f'OUTP {int(self.output_actual)}')
+
+    def update_output_state(self, raw_value):
+        # The PSU is authoritative. No pending state or extra confirmation timer.
+        normalized = str(raw_value).strip()
+        self.output_actual = normalized == '1' if normalized in ('0', '1') else None
+        self.render_output_switch()
+
+    def reset_output_switch(self):
+        self.output_actual = None
+        self.render_output_switch()
 
     def make_control(self, parent, key, title, maximum, resolution, command, unit):
         line = tk.Frame(parent, bg=PANEL)
@@ -337,6 +427,7 @@ class App(tk.Tk):
 
     def start_connection(self):
         self.connected = False
+        self.reset_output_switch()
         self.status.set(f'Connecting to {self.port}…')
         self.commands = queue.Queue()
         self.events = queue.Queue()
@@ -348,6 +439,7 @@ class App(tk.Tk):
 
     def reconnect(self):
         self.connected = False
+        self.reset_output_switch()
         self.status.set('Reconnecting…')
         self.stop_worker.set()
         # Do not open the new port until the old Serial handle has closed.
@@ -363,7 +455,7 @@ class App(tk.Tk):
     def reset_readings(self):
         self.update_mode_indicator('?', '0')
         self.mode.set('MODE: ?')
-        self.output.set('OUTPUT: ?')
+        self.reset_output_switch()
         self.energy_label.config(text='— Wh')
         for widget, unit in self.values.values():
             widget.config(text=f'— {unit}')
@@ -489,6 +581,7 @@ class App(tk.Tk):
                 if kind == 'connected':
                     self.connected = True
                     self.status.set(f'Connected: {data}')
+                    self.render_output_switch()
                 elif kind == 'readings':
                     for key in ('v', 'i', 'p'):
                         widget, unit = self.values[key]
@@ -501,14 +594,13 @@ class App(tk.Tk):
                     self.adc_labels['v'].config(text=f'ADC: {data["raw_v"]}')
                     self.adc_labels['i'].config(text=f'ADC: {data["raw_i"]}')
                     self.update_mode_indicator(data['mode'], data['out'])
-                    self.output.set('OUTPUT: ON' if data['out'] == '1'
-                                    else 'OUTPUT: OFF' if data['out'] == '0'
-                                    else f'OUTPUT: {data["out"]}')
+                    self.update_output_state(data['out'])
                     self.energy_label.config(text=f'{data["e"]} Wh')
                 elif kind == 'error':
                     self.status.set(f'Error: {data}')
                 elif kind == 'disconnected':
                     self.connected = False
+                    self.reset_output_switch()
                     self.update_mode_indicator('?', '0')
                     self.mode.set('MODE: ?')
                     if not self.stop_worker.is_set():
