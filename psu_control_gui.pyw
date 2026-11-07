@@ -1,11 +1,13 @@
 """SCPI laboratory power supply GUI.
 
 Requires: pip install pyserial
+SCPI replies are type-checked. One request is read at a time, with a configurable timeout.
 Settings are stored in psu_control_gui.ini beside this script.
 SOUR:*:RAW? readings are labeled DAC (setpoint raw) as in PSU firmware protocol.
 """
 
 import configparser
+import math
 import queue
 import threading
 import time
@@ -26,8 +28,9 @@ except ImportError:
 DEFAULT_PORT = 'COM4'
 DEFAULT_BAUDRATE = 9600
 CONFIG_FILE = Path(__file__).resolve().with_name('psu_control_gui.ini')
-VOLTAGE_MAX = 30.0
-CURRENT_MAX = 3.0
+DEFAULT_VOLTAGE_SCALE = 30.0   # Initial slider range, not a limit on commands
+DEFAULT_CURRENT_SCALE = 3.0   # Sliders grow if a setpoint exceeds their range
+DEFAULT_RESPONSE_TIMEOUT = 2.0
 POLL_SECONDS = 0.1  # Pause between completed query rounds; UART throughput sets the actual rate.
 BG = '#101827'
 PANEL = '#1e293b'
@@ -39,79 +42,167 @@ def load_settings():
         parser.read(CONFIG_FILE, encoding='utf-8')
         port = parser.get('serial', 'port', fallback=DEFAULT_PORT).strip() or DEFAULT_PORT
         baudrate = parser.getint('serial', 'baudrate', fallback=DEFAULT_BAUDRATE)
-        if baudrate <= 0:
-            raise ValueError('Baudrate must be positive')
-        return port, baudrate
+        timeout = parser.getfloat('serial', 'timeout', fallback=DEFAULT_RESPONSE_TIMEOUT)
+        voltage_scale = parser.getfloat('controls', 'voltage_scale', fallback=DEFAULT_VOLTAGE_SCALE)
+        current_scale = parser.getfloat('controls', 'current_scale', fallback=DEFAULT_CURRENT_SCALE)
+        if (baudrate <= 0 or not all(math.isfinite(v) and v > 0
+                                    for v in (timeout, voltage_scale, current_scale))):
+            raise ValueError('Invalid serial or slider settings')
+        return port, baudrate, timeout, voltage_scale, current_scale
     except (OSError, ValueError, configparser.Error):
-        return DEFAULT_PORT, DEFAULT_BAUDRATE
+        return (DEFAULT_PORT, DEFAULT_BAUDRATE, DEFAULT_RESPONSE_TIMEOUT,
+                DEFAULT_VOLTAGE_SCALE, DEFAULT_CURRENT_SCALE)
 
 
-def save_settings(port, baudrate):
+def save_settings(port, baudrate, timeout, voltage_scale, current_scale):
     parser = configparser.ConfigParser()
-    parser['serial'] = {'port': port, 'baudrate': str(baudrate)}
+    parser.read(CONFIG_FILE, encoding='utf-8')
+    parser['serial'] = {'port': port, 'baudrate': str(baudrate),
+                        'timeout': str(timeout)}
+    parser['controls'] = {'voltage_scale': str(voltage_scale),
+                          'current_scale': str(current_scale)}
     with CONFIG_FILE.open('w', encoding='utf-8') as output:
         parser.write(output)
 
 
+class SCPIReplyError(ValueError):
+    """A query timed out or received a reply of the wrong type."""
+
+
 class SerialWorker(threading.Thread):
+    # Query replies must arrive in the order the requests are sent.
+    # OUTP?/MEAS:MODE? have recognizable reply types, so we ask them first.
     QUERIES = (
+        ('out', 'OUTP?'),
+        ('mode', 'MEAS:MODE?'),
         ('set_v', 'SOUR:VOLT?'),
         ('set_i', 'SOUR:CURR?'),
-        ('dac_v', 'SOUR:VOLT:RAW?'),
-        ('dac_i', 'SOUR:CURR:RAW?'),
-        ('out', 'OUTP?'),
         ('v', 'MEAS:VOLT?'),
         ('i', 'MEAS:CURR?'),
         ('p', 'MEAS:POW?'),
         ('e', 'MEAS:ENER?'),
-        ('mode', 'MEAS:MODE?'),
+        ('dac_v', 'SOUR:VOLT:RAW?'),
+        ('dac_i', 'SOUR:CURR:RAW?'),
         ('raw_v', 'MEAS:VOLT:RAW?'),
         ('raw_i', 'MEAS:CURR:RAW?'),
+        # Catch a shifted response stream at the END of the round too.
+        ('out_check', 'OUTP?'),
     )
 
-    def __init__(self, port, baudrate, commands, events, stop):
+    def __init__(self, port, baudrate, timeout, commands, events, stop):
         super().__init__(daemon=True)
         self.port = port
         self.baudrate = baudrate
+        self.timeout = timeout
         self.commands = commands
         self.events = events
         self.stop = stop
 
     @staticmethod
-    def query(ser, command):
-        ser.write((command + '\n').encode('ascii'))
-        response = ser.readline().decode('ascii', errors='replace').strip()
-        if not response or response.startswith('ERR:'):
-            raise ValueError(f'{command}: {response or "no response"}')
+    def _line(ser):
+        raw = ser.readline()
+        # A partial line returned by a timeout must not become a valid number
+        # (e.g. b'5.' instead of b'5.000\n').
+        if raw and not raw.endswith(b'\n'):
+            raise SCPIReplyError('incomplete SCPI response (missing newline)')
+        return raw.decode('ascii', errors='replace').strip()
+
+    @staticmethod
+    def check_response(key, command, response):
+        if not response:
+            raise SCPIReplyError(f'{command}: no response before timeout')
+        # Optional raw queries may be unsupported on another SCPI supply.
+        if response.startswith('ERR:'):
+            if key in ('dac_v', 'dac_i', 'raw_v', 'raw_i'):
+                return '—'
+            raise SCPIReplyError(f'{command}: {response}')
+        if key in ('out', 'out_check'):
+            if response not in ('0', '1'):
+                raise SCPIReplyError(f'{command}: expected 0/1, got {response!r}')
+        elif key == 'mode':
+            if response.upper() not in ('CV', 'CC', 'OFF'):
+                raise SCPIReplyError(f'{command}: unexpected mode {response!r}')
+        else:
+            try:
+                number = float(response)
+            except ValueError:
+                raise SCPIReplyError(f'{command}: expected number, got {response!r}') from None
+            if not math.isfinite(number):
+                raise SCPIReplyError(f'{command}: non-finite number {response!r}')
+            # Deliberately do NOT restrict voltage, current, power, energy,
+            # or raw values: ranges vary between different PSU models.
         return response
+
+    @classmethod
+    def query(cls, ser, key, command):
+        # Send ONE query, wait for ONE complete line, only then send the next.
+        ser.write((command + '\n').encode('ascii'))
+        ser.flush()
+        return cls.check_response(key, command, cls._line(ser))
+
+    def discard_late_replies(self, ser):
+        """Drain stale lines after a timeout; never use IDN as a sync marker.
+
+        Waiting for a quiet receive buffer improves recovery, but arbitrary
+        delays cannot be solved perfectly by an untagged line protocol.
+        """
+        quiet_until = time.monotonic() + 0.7
+        deadline = time.monotonic() + max(2.5, self.timeout + 0.7)
+        while not self.stop.is_set() and time.monotonic() < deadline:
+            waiting = ser.in_waiting
+            if waiting:
+                ser.read(waiting)
+                quiet_until = time.monotonic() + 0.7
+            if time.monotonic() >= quiet_until:
+                break
+            self.stop.wait(0.05)
+        ser.reset_input_buffer()
 
     def run(self):
         try:
-            with serial.Serial(self.port, self.baudrate, timeout=0.4, write_timeout=0.5) as ser:
+            with serial.Serial(self.port, self.baudrate, timeout=self.timeout,
+                               write_timeout=max(1.0, self.timeout)) as ser:
                 if self.stop.wait(2):
                     return
-                self.events.put(('connected', self.query(ser, '*IDN?')))
+                ser.reset_input_buffer()
+                # IDN is asked once for the header only. It is NOT used for
+                # resynchronization or required to follow any fixed pattern.
+                ser.write(b'*IDN?\n')
+                ser.flush()
+                try:
+                    device_id = self._line(ser)
+                except SCPIReplyError:
+                    device_id = ''
+                if not device_id or device_id.startswith('ERR:'):
+                    device_id = self.port
+                    self.discard_late_replies(ser)
+                self.events.put(('connected', device_id))
                 next_poll = 0.0
                 while not self.stop.is_set():
                     try:
-                        while True:
-                            command = self.commands.get_nowait()
-                            ser.write((command + '\n').encode('ascii'))
-                    except queue.Empty:
-                        pass
+                        # Serial output commands do not expect a reply.
+                        try:
+                            while True:
+                                command = self.commands.get_nowait()
+                                ser.write((command + '\n').encode('ascii'))
+                                ser.flush()
+                        except queue.Empty:
+                            pass
 
-                    if time.monotonic() >= next_poll:
-                        readings = {}
-                        for key, command in self.QUERIES:
-                            if self.stop.is_set():
-                                break
-                            try:
-                                readings[key] = self.query(ser, command)
-                            except ValueError:
-                                # Unsupported query: show a dash, do not stop polling.
-                                readings[key] = '—'
-                        if not self.stop.is_set():
-                            self.events.put(('readings', readings))
+                        if time.monotonic() >= next_poll:
+                            readings = {}
+                            for key, command in self.QUERIES:
+                                if self.stop.is_set():
+                                    break
+                                readings[key] = self.query(ser, key, command)
+                            if not self.stop.is_set():
+                                # Publish the complete round only; a partial
+                                # round must not corrupt the displayed fields.
+                                self.events.put(('readings', readings))
+                            next_poll = time.monotonic() + POLL_SECONDS
+                    except SCPIReplyError as error:
+                        self.events.put(('query_error', str(error)))
+                        self.discard_late_replies(ser)
                         next_poll = time.monotonic() + POLL_SECONDS
                     self.stop.wait(0.03)
         except (serial.SerialException, ValueError, OSError) as error:
@@ -129,14 +220,13 @@ class App(tk.Tk):
         self.minsize(720, 480)
         self.configure(bg=BG)
 
-        self.port, self.baudrate = load_settings()
+        self.port, self.baudrate, self.response_timeout, self.v_scale, self.i_scale = load_settings()
         self.commands = queue.Queue()
         self.events = queue.Queue()
         self.stop_worker = threading.Event()
         self.worker = None
         self.connected = False
         self.status = tk.StringVar(value='Disconnected')
-        self.output = tk.StringVar(value='OUTPUT')
         self.mode = tk.StringVar(value='MODE: ?')
         self.connection_info = tk.StringVar()
         self.values = {}
@@ -201,7 +291,19 @@ class App(tk.Tk):
                 bar.pack_propagate(False)
                 self.mode_bars[key] = bar
             if key == 'p':
-                self.label(frame, 'ENERGY', 10, '#94a3b8').pack(anchor='w')
+                # *RST affects the whole instrument, not just its energy meter.
+                # Keep the button on the energy line without adding height.
+                energy_header = tk.Frame(frame, bg=PANEL)
+                energy_header.pack(fill='x')
+                self.label(energy_header, 'ENERGY', 10, '#94a3b8').pack(side='left')
+                self.reset_button = tk.Button(
+                    energy_header, text='Reset PSU', command=self.reset_psu,
+                    state='disabled', bg='#334155', fg='#e2e8f0',
+                    disabledforeground='#64748b', activebackground='#475569',
+                    activeforeground='#f8fafc', relief='flat', bd=0,
+                    highlightthickness=0, takefocus=0,
+                    font=('Segoe UI', 9), padx=7, pady=1)
+                self.reset_button.pack(side='right')
                 self.energy_label = self.label(frame, '— Wh', 17, '#7dd3fc')
                 self.energy_label.pack(anchor='w', pady=(0, 4))
             heading = tk.Frame(frame, bg=PANEL)
@@ -219,8 +321,8 @@ class App(tk.Tk):
         controls.pack(fill='x', padx=20, pady=6)
         self.label(controls, 'SETPOINT CONTROLS', 13, '#f8fafc').pack(anchor='w')
         for key, title, maximum, resolution, command, unit in (
-            ('set_v', 'Voltage', VOLTAGE_MAX, 0.01, 'SOUR:VOLT', 'V'),
-            ('set_i', 'Current', CURRENT_MAX, 0.001, 'SOUR:CURR', 'A'),
+            ('set_v', 'Voltage', self.v_scale, 0.01, 'SOUR:VOLT', 'V'),
+            ('set_i', 'Current', self.i_scale, 0.001, 'SOUR:CURR', 'A'),
         ):
             self.make_control(controls, key, title, maximum, resolution, command, unit)
 
@@ -243,7 +345,7 @@ class App(tk.Tk):
         self._switch_images = {}
         self.output_switch.pack(side='right', padx=(4, 8))
         self.output_switch.bind('<Button-1>', self.toggle_output)
-        self.label(bottom, textvariable=self.output, size=13,
+        self.label(bottom, 'OUTPUT', size=13,
                    color='#e2e8f0').pack(side='right', padx=(8, 4))
         self.render_output_switch()
 
@@ -352,6 +454,7 @@ class App(tk.Tk):
                           bg=PANEL, fg='#e2e8f0', troughcolor='#334155',
                           highlightthickness=0, showvalue=False,
                           command=slider_changed)
+        state['slider'] = slider
         slider.pack(side='left', fill='x', expand=True)
         slider.bind('<ButtonPress-1>', lambda _event: state.update(slider_active=True, editing=True))
         slider.bind('<ButtonRelease-1>', lambda _event: state.update(slider_active=False))
@@ -363,10 +466,10 @@ class App(tk.Tk):
         def apply():
             try:
                 value = float(entry.get().replace(',', '.'))
-                if not 0 <= value <= maximum:
+                if not math.isfinite(value):
                     raise ValueError
             except ValueError:
-                messagebox.showerror('Invalid value', f'Enter a value from 0 to {maximum}.')
+                messagebox.showerror('Invalid value', 'Enter a finite numeric value.')
                 return
             if not self.connected:
                 messagebox.showwarning('Disconnected', 'No serial connection.')
@@ -386,14 +489,25 @@ class App(tk.Tk):
         actual = self.label(parent, f'Device setpoint: — {unit}', 11, '#86efac')
         actual.pack(anchor='w', padx=86, pady=(0, 2))
         state['actual'] = actual
-        state['dac_raw'] = '—'
         state['unit'] = unit
         state['resolution'] = resolution
 
     @staticmethod
-    def sync_control(state, value):
+    def expand_slider_if_needed(state, value):
+        """Allow larger (or negative) setpoints without editing the program."""
+        slider = state['slider']
+        lo = float(slider.cget('from'))
+        hi = float(slider.cget('to'))
+        if value < lo:
+            slider.configure(from_=min(value * 1.2, value - 0.01))
+        if value > hi:
+            slider.configure(to=max(value * 1.2, hi * 1.5))
+
+    @classmethod
+    def sync_control(cls, state, value):
         state['syncing'] = True
         try:
+            cls.expand_slider_if_needed(state, value)
             state['var'].set(value)
             entry = state['entry']
             entry.delete(0, 'end')
@@ -403,13 +517,13 @@ class App(tk.Tk):
 
     def update_setpoint(self, key, raw_value, dac_raw):
         state = self.controls[key]
-        state['dac_raw'] = dac_raw
         try:
             value = float(raw_value)
         except (TypeError, ValueError):
             state['actual'].config(text=f'Device setpoint: {raw_value} {state["unit"]} (DAC: {dac_raw})')
             return
         state['actual'].config(text=f'Device setpoint: {value:.3f} {state["unit"]} (DAC: {dac_raw})')
+        self.expand_slider_if_needed(state, value)
         if state['pending'] is not None:
             if abs(value - state['pending']) <= state['resolution'] / 2 + 0.00001:
                 state['pending'] = None
@@ -427,18 +541,20 @@ class App(tk.Tk):
 
     def start_connection(self):
         self.connected = False
+        self.reset_button.configure(state='disabled')
         self.reset_output_switch()
         self.status.set(f'Connecting to {self.port}…')
         self.commands = queue.Queue()
         self.events = queue.Queue()
         self.stop_worker = threading.Event()
-        self.worker = SerialWorker(self.port, self.baudrate,
+        self.worker = SerialWorker(self.port, self.baudrate, self.response_timeout,
                                    self.commands, self.events, self.stop_worker)
         self.worker.start()
         self.refresh_connection_info()
 
     def reconnect(self):
         self.connected = False
+        self.reset_button.configure(state='disabled')
         self.reset_output_switch()
         self.status.set('Reconnecting…')
         self.stop_worker.set()
@@ -453,8 +569,7 @@ class App(tk.Tk):
         self.start_connection()
 
     def reset_readings(self):
-        self.update_mode_indicator('?', '0')
-        self.mode.set('MODE: ?')
+        self.update_mode_indicator('?', '?')
         self.reset_output_switch()
         self.energy_label.config(text='— Wh')
         for widget, unit in self.values.values():
@@ -483,6 +598,9 @@ class App(tk.Tk):
         content.pack(fill='both', expand=True)
         port_var = tk.StringVar(value=self.port)
         baud_var = tk.StringVar(value=str(self.baudrate))
+        timeout_var = tk.StringVar(value=str(self.response_timeout))
+        voltage_scale_var = tk.StringVar(value=str(self.v_scale))
+        current_scale_var = tk.StringVar(value=str(self.i_scale))
 
         self.label(content, 'COM port', 11, '#f8fafc').grid(
             row=0, column=0, sticky='w', pady=(0, 10))
@@ -507,8 +625,20 @@ class App(tk.Tk):
         baud_picker.grid(row=1, column=1, sticky='ew', padx=(12, 5), pady=(0, 14))
         refresh_ports()
 
+        for row, title, var in (
+            (2, 'Response timeout (s)', timeout_var),
+            (3, 'Voltage slider range (V)', voltage_scale_var),
+            (4, 'Current slider range (A)', current_scale_var),
+        ):
+            self.label(content, title, 11, '#f8fafc').grid(
+                row=row, column=0, sticky='w', pady=(0, 12))
+            tk.Entry(content, textvariable=var, width=26,
+                     bg='#334155', fg='white', insertbackground='white',
+                     relief='flat', font=('Segoe UI', 11)).grid(
+                row=row, column=1, sticky='ew', padx=(12, 5), pady=(0, 12))
+
         buttons = tk.Frame(content, bg=PANEL)
-        buttons.grid(row=2, column=0, columnspan=3, sticky='e')
+        buttons.grid(row=5, column=0, columnspan=3, sticky='e')
 
         def close_dialog():
             self._settings_dialog = None
@@ -518,25 +648,43 @@ class App(tk.Tk):
             port = port_var.get().strip()
             try:
                 baudrate = int(baud_var.get().strip())
+                timeout = float(timeout_var.get().strip().replace(',', '.'))
+                voltage_scale = float(voltage_scale_var.get().strip().replace(',', '.'))
+                current_scale = float(current_scale_var.get().strip().replace(',', '.'))
             except ValueError:
-                baudrate = 0
-            if not port or baudrate <= 0:
+                baudrate, timeout, voltage_scale, current_scale = 0, 0, 0, 0
+            if (not port or baudrate <= 0 or
+                not all(math.isfinite(x) and x > 0
+                        for x in (timeout, voltage_scale, current_scale))):
                 messagebox.showerror('Invalid settings',
-                                     'Enter a COM port and a positive baudrate.',
-                                     parent=dialog)
+                                     'Enter a COM port, positive baudrate, '
+                                     'timeout and slider ranges.', parent=dialog)
                 return
             try:
-                save_settings(port, baudrate)
+                save_settings(port, baudrate, timeout, voltage_scale, current_scale)
             except OSError as error:
                 messagebox.showerror('Cannot save settings',
                                      f'Could not write {CONFIG_FILE}:\n{error}',
                                      parent=dialog)
                 return
-            changed = (port, baudrate) != (self.port, self.baudrate)
-            self.port, self.baudrate = port, baudrate
+            serial_changed = (port, baudrate, timeout) != (
+                self.port, self.baudrate, self.response_timeout)
+            self.port, self.baudrate, self.response_timeout = port, baudrate, timeout
+            self.v_scale, self.i_scale = voltage_scale, current_scale
+            for key, rng in (('set_v', voltage_scale), ('set_i', current_scale)):
+                state = self.controls[key]
+                # Settings change the preferred slider size; currently shown
+                # values may expand it to remain usable, never clamp readings.
+                state['slider'].configure(from_=0, to=rng)
+                try:
+                    shown = float(state['entry'].get().replace(',', '.'))
+                    if math.isfinite(shown):
+                        self.expand_slider_if_needed(state, shown)
+                except ValueError:
+                    pass
             self.refresh_connection_info()
             close_dialog()
-            if changed or not self.connected:
+            if serial_changed or not self.connected:
                 self.reconnect()
 
         tk.Button(buttons, text='Cancel', command=close_dialog,
@@ -549,11 +697,28 @@ class App(tk.Tk):
         dialog.bind('<Escape>', lambda _event: close_dialog())
         port_picker.focus_set()
 
-    def send(self, command):
+    def reset_psu(self):
+        # *RST is a full instrument reset; it must not be presented as a
+        # harmless energy-counter-only reset.
         if not self.connected:
-            messagebox.showwarning('Disconnected', 'No serial connection.')
+            messagebox.showwarning('Disconnected', 'No serial connection.', parent=self)
             return
-        self.commands.put(command)
+        if not messagebox.askyesno(
+            'Reset power supply',
+            'Send *RST to the power supply?\n\n'
+            'This can reset the energy counter, output state, and voltage/current '
+            'setpoints depending on the PSU firmware.',
+            icon='warning', default='no', parent=self
+        ):
+            return
+        # Do not clear readings, sliders, edit fields or their focus here.
+        # Cancel only an outstanding Apply grace period: otherwise it can
+        # briefly prevent the regular poll from syncing post-reset setpoints.
+        for control in self.controls.values():
+            control['pending'] = None
+        # The worker sends the command in sequence with other SCPI traffic.
+        # The next normal reading round is the sole source of GUI values.
+        self.commands.put('*RST')
 
     def update_mode_indicator(self, mode, output):
         normalized = str(mode).strip().upper()
@@ -572,7 +737,10 @@ class App(tk.Tk):
         else:
             color, border = '#475569', '#64748b'
         self.mode_led.itemconfig(self.mode_led_circle, fill=color, outline=border)
-        self.mode.set(f'MODE: {mode}' if enabled else 'MODE: OFF')
+        if str(output).strip() not in ('0', '1'):
+            self.mode.set('MODE: ?')
+        else:
+            self.mode.set(f'MODE: {normalized}' if enabled else 'MODE: OFF')
 
     def drain_events(self):
         try:
@@ -580,9 +748,14 @@ class App(tk.Tk):
                 kind, data = self.events.get_nowait()
                 if kind == 'connected':
                     self.connected = True
+                    self.reset_button.configure(state='normal')
+                    self._device_id = data
                     self.status.set(f'Connected: {data}')
                     self.render_output_switch()
                 elif kind == 'readings':
+                    # A complete, validated response round restored sync.
+                    if self.connected and not self.status.get().startswith('Connected:'):
+                        self.status.set('Connected: ' + getattr(self, '_device_id', self.port))
                     for key in ('v', 'i', 'p'):
                         widget, unit = self.values[key]
                         try:
@@ -596,13 +769,17 @@ class App(tk.Tk):
                     self.update_mode_indicator(data['mode'], data['out'])
                     self.update_output_state(data['out'])
                     self.energy_label.config(text=f'{data["e"]} Wh')
+                elif kind == 'query_error':
+                    # Keep previous complete readings visible during recovery.
+                    command = str(data).split(': ', 1)[0]
+                    self.status.set(f'SCPI retry ({command})…')
                 elif kind == 'error':
                     self.status.set(f'Error: {data}')
                 elif kind == 'disconnected':
                     self.connected = False
+                    self.reset_button.configure(state='disabled')
                     self.reset_output_switch()
-                    self.update_mode_indicator('?', '0')
-                    self.mode.set('MODE: ?')
+                    self.update_mode_indicator('?', '?')
                     if not self.stop_worker.is_set():
                         if not self.status.get().startswith('Error:'):
                             self.status.set('Disconnected')
