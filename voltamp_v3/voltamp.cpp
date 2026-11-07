@@ -67,15 +67,11 @@ void updateState() {
     Scheduler::setTimer(updateState, 8);
 }
 
+// Periodically compensate for analog regulation offset drift.
 void correctOutput() {
     bool cc = Buttons::isConstantCurrentMode();
 
     if (!cc) {
-        // Disable current correction outside CC mode.
-        // The op-amp temperature and its resulting input offset drift
-        // are unknown, so applying a correction could increase the error.
-        PowerSupplier::setCurrentCorrection(0);
-
         // Compensate for the difference between the measured output voltage
         // and the voltage setpoint, accounting for the existing correction.
         int16_t voltage = Multimeter::getVoltage();
@@ -92,12 +88,8 @@ void correctOutput() {
 
         PowerSupplier::setVoltageCorrection(correction);
     } else {
-        // Disable voltage correction while operating in CC mode.
-        PowerSupplier::setVoltageCorrection(0);
-
         // In CC mode, the difference between the measured current and
         // the setpoint is used to compensate for thermal offset drift.
-        // This function runs every 2 seconds to reduce oscillations.
         int16_t current = Multimeter::getCurrent();
         int16_t currentLimit = PowerSupplier::getCurrent();
         int16_t error = currentLimit - current;
@@ -200,7 +192,7 @@ int main(void) {
         Scheduler::setTimer(updateEncoders, 10, true);
         Scheduler::setTimer(updateState, 1);
         Scheduler::setTimer(updateSettings, 1000, true);
-        Scheduler::setTimer(correctOutput, 200, true);
+        Scheduler::setTimer(correctOutput, 100, true);
 
         PowerSupplier::setCurrent(Settings::getCurrent());
         PowerSupplier::setVoltage(Settings::getVoltage());
