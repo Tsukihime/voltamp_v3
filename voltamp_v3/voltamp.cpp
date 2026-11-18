@@ -78,8 +78,8 @@ void correctOutput() {
         int16_t voltageLimit = PowerSupplier::getVoltage();
         int16_t error = voltageLimit - voltage;
         
-        // Ignore deviations within +/-1 mV to prevent DAC hunting.
-        if (abs(error) <= 1) return;
+        // Deadband slightly larger than half the 8 mV DAC step to prevent hunting.
+        if (abs(error) <= 5) return;
         
         int16_t correction = error + PowerSupplier::getVoltageCorrection();
         
