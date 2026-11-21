@@ -2,7 +2,7 @@
 
 Requires: pip install pyserial pillow  (Pillow optional for switch/PNG)
 Graph history is prepared in a background thread; Tk widgets remain on the UI thread.
-Graph lanes show the latest numeric reading in a right-hand gutter.
+Graph lanes show latest readings and support a hover measurement cursor.
 Errors are written to psu_control_gui.log beside the script.
 SCPI replies are type-checked. One request is read at a time, with a configurable timeout.
 Serial settings, slider scales and automation rules are kept in one psu_control_gui.json.
@@ -11,6 +11,7 @@ Audible alarms use a self-generated WAV, not Windows system event sounds.
 """
 
 import array
+from bisect import bisect_left
 import io
 import json
 import logging
@@ -499,6 +500,9 @@ class GraphsDialog(tk.Toplevel):
         self._render_version = 0
         self._render_pending = False
         self._result_job = None
+        self._cursor_meta = None  # Layout and exact samples from the rendered frame.
+        self._hover_x = None
+        self._hover_job = None
         self._build()
         self._render_thread = threading.Thread(target=self._plot_worker,
                                                name='PSU graph preparation', daemon=True)
@@ -542,11 +546,17 @@ class GraphsDialog(tk.Toplevel):
                            bg=BG, fg=color, activebackground=BG,
                            activeforeground=color, selectcolor=PANEL,
                            font=('Segoe UI', 10), command=self.request_redraw).pack(side='left', padx=(0, 14))
-        self.canvas = tk.Canvas(self, bg=PANEL, bd=0, highlightthickness=0)
+        self.cursor_text = tk.StringVar(value='Move mouse over a graph to inspect samples')
+        self.app.label(filters, textvariable=self.cursor_text, color='#cbd5e1',
+                       size=10, anchor='e').pack(side='right', padx=(8, 0))
+        self.canvas = tk.Canvas(self, bg=PANEL, bd=0, highlightthickness=0,
+                                cursor='crosshair')
         self.canvas.pack(fill='both', expand=True, padx=16, pady=(5, 4))
         self.app.label(self, textvariable=self.info, color='#94a3b8', size=10,
                        anchor='w').pack(fill='x', padx=17, pady=(1, 10))
         self.canvas.bind('<Configure>', lambda _event: self.request_redraw())
+        self.canvas.bind('<Motion>', self._cursor_motion)
+        self.canvas.bind('<Leave>', self._cursor_leave)
 
     def request_redraw(self):
         """Coalesce rapid View/filter/resize events into one canvas redraw."""
@@ -653,23 +663,25 @@ class GraphsDialog(tk.Toplevel):
                                      window, width, height)
 
     @staticmethod
-    def _plot_scene_data(data, visible, window, width, height):
-        """Prepare graph paths from a snapshot; NO Tkinter calls are allowed here."""
+    def _plot_scene_data(data, visible, window, width, height, with_cursor=False):
+        """Prepare graph paths and optional hover data without touching Tkinter."""
         instructions = []
         if not data or not visible:
-            return [('text', width / 2, height / 2,
-                     'No measurements to display', '#94a3b8', 'center', 16)]
+            instructions = [('text', width / 2, height / 2,
+                             'No measurements to display', '#94a3b8', 'center', 16)]
+            return (instructions, None) if with_cursor else instructions
 
         latest = data[-1]['time']
         start = latest - window if window is not None else data[0]['time']
         data = [item for item in data if item['time'] >= start]
         if not data:
-            return instructions
+            return (instructions, None) if with_cursor else instructions
         earliest = latest - window if window is not None else data[0]['time']
         x1, x2 = 85, width - 140  # right gutter for latest value in each lane
         top, bottom = 15, height - 36
         area_h = max(20, (bottom - top) / len(visible))
         dx = max(0.001, latest - earliest)
+        lane_layout = {}
 
         for n, (key, name, unit, color) in enumerate(visible):
             lane_top = top + n * area_h
@@ -682,11 +694,13 @@ class GraphsDialog(tk.Toplevel):
             high += pad
             plot_top = lane_top + 29
             lane_height = max(3, lane_bottom - plot_top - 2)
+            if with_cursor:
+                lane_layout[key] = (plot_top, lane_height, low, high, unit, color)
             instructions.append(('text', x1 + 12, lane_top + 5,
                                  f'{name} ({unit})', color, 'left', 12))
-            # Display the actual last sample, not the axis maximum or a rounded tick.
-            # This appears in PNG export too, because both use the same scene.
-            instructions.append(('text', x2 + 15, lane_top + 36,
+            # The right gutter shows the latest value, or the selected sample
+            # while hovering. The text is updated without repainting the plot.
+            instructions.append(('value', key, x2 + 15, lane_top + 36,
                                  f'{vals[-1]:.3f} {unit}', color, 'left', 13))
             instructions.append(('text', x1 - 8, plot_top, f'{high:.3f}',
                                  '#94a3b8', 'right', 10))
@@ -729,7 +743,18 @@ class GraphsDialog(tk.Toplevel):
             fmt = '%H:%M:%S' if dx < 3600 else '%d %b %H:%M'
             instructions.append(('text', x, height - 24, stamp.strftime(fmt),
                                  '#94a3b8', 'center', 10))
-        return instructions
+        if not with_cursor:
+            return instructions
+        # The exact displayed records and timestamps are prepared off the UI
+        # thread, so mouse movement only performs an O(log N) binary search.
+        cursor = {
+            'samples': tuple(data),
+            'times': tuple(record['time'] for record in data),
+            'x1': x1, 'x2': x2, 'top': top, 'bottom': bottom,
+            'earliest': earliest, 'dx': dx,
+            'lanes': lane_layout,
+        }
+        return instructions, cursor
 
     @staticmethod
     def _offer_latest(q, value):
@@ -750,14 +775,15 @@ class GraphsDialog(tk.Toplevel):
             except queue.Empty:
                 continue
             try:
-                scene = self._plot_scene_data(data, visible, window, width, height)
+                scene, cursor = self._plot_scene_data(
+                    data, visible, window, width, height, with_cursor=True)
                 error = None
             except Exception as exc:
                 LOGGER.exception('Graph data preparation failed')
-                scene = None
+                scene, cursor = None, None
                 error = f'{type(exc).__name__}: {exc}'
             if not self._render_stop.is_set():
-                self._offer_latest(self._render_results, (version, scene, error))
+                self._offer_latest(self._render_results, (version, scene, cursor, error))
 
     def draw(self, force=True):
         """Queue a snapshot; don't starve slow computers with endless new jobs."""
@@ -782,14 +808,14 @@ class GraphsDialog(tk.Toplevel):
         self._result_job = None
         try:
             while True:
-                version, scene, error = self._render_results.get_nowait()
+                version, scene, cursor, error = self._render_results.get_nowait()
                 if version != self._render_version:
                     continue
                 self._render_pending = False
                 if error:
                     self.info.set('Graph error: ' + error)
                 else:
-                    self._paint_scene(scene)
+                    self._paint_scene(scene, cursor)
         except queue.Empty:
             pass
         except Exception as exc:
@@ -799,22 +825,97 @@ class GraphsDialog(tk.Toplevel):
             if self.winfo_exists():
                 self._result_job = self.after(75, self._collect_scenes)
 
-    def _paint_scene(self, scene):
+    def _paint_scene(self, scene, cursor):
         cv = self.canvas
         cv.delete('all')
+        self._cursor_meta = cursor
         for item in scene:
             if item[0] == 'line':
                 _, coords, color, thickness = item
                 cv.create_line(*coords, fill=color, width=thickness)
-            elif item[0] == 'text':
-                _, x, y, msg, color, align, size = item
+            elif item[0] in ('text', 'value'):
+                if item[0] == 'value':
+                    _, key, x, y, msg, color, align, size = item
+                    tags = (f'value_{key}',)
+                else:
+                    _, x, y, msg, color, align, size = item
+                    tags = ()
                 cv.create_text(x, y, text=msg, fill=color,
-                               font=('Segoe UI', size),
+                               font=('Segoe UI', size), tags=tags,
                                anchor={'left': 'nw', 'right': 'ne', 'center': 'center'}[align])
             elif item[0] == 'circle':
                 _, x, y, radius, color = item
                 cv.create_oval(x-radius, y-radius, x+radius, y+radius,
                                fill=color, outline=color)
+        # A live redraw must not erase the cursor while the mouse is stationary.
+        self._update_cursor_overlay()
+
+    def _cursor_motion(self, event):
+        """Record pointer position, but cap hover drawing to ~30 fps."""
+        self._hover_x = event.x
+        if self._hover_job is None:
+            self._hover_job = self.after(30, self._cursor_tick)
+
+    def _cursor_tick(self):
+        self._hover_job = None
+        self._update_cursor_overlay()
+
+    def _cursor_leave(self, _event):
+        self._hover_x = None
+        if self._hover_job is not None:
+            self.after_cancel(self._hover_job)
+            self._hover_job = None
+        self._update_cursor_overlay()
+
+    def _update_cursor_overlay(self):
+        """Show the nearest ACTUAL sample at the pointer's timestamp.
+
+        Only transient Canvas objects are changed: full graph paths are kept.
+        The cursor metadata corresponds exactly to the displayed frame, even
+        when a new frame is still being prepared by the background worker.
+        """
+        cv = self.canvas
+        cv.delete('measurement_cursor')
+        meta = self._cursor_meta
+        if not meta:
+            self.cursor_text.set('Move mouse over a graph to inspect samples')
+            return
+
+        def restore_latest():
+            last = meta['samples'][-1]
+            for key, (_top, _height, _low, _high, unit, _color) in meta['lanes'].items():
+                cv.itemconfigure(f'value_{key}', text=f'{last[key]:.3f} {unit}')
+            self.cursor_text.set('Move mouse over a graph to inspect samples')
+
+        x = self._hover_x
+        if x is None or not meta['x1'] <= x <= meta['x2']:
+            restore_latest()
+            return
+        target_time = meta['earliest'] + (x - meta['x1']) / (meta['x2'] - meta['x1']) * meta['dx']
+        times = meta['times']
+        index = bisect_left(times, target_time)
+        if index >= len(times):
+            index = len(times) - 1
+        elif index > 0 and abs(times[index - 1] - target_time) <= abs(times[index] - target_time):
+            index -= 1
+        sample = meta['samples'][index]
+        selected_x = meta['x1'] + (times[index] - meta['earliest']) / meta['dx'] * (meta['x2'] - meta['x1'])
+        # Do not jump to a distant sample when the cursor is in an empty
+        # portion of the selected time window or across a long logging gap.
+        if abs(selected_x - x) > 18:
+            restore_latest()
+            return
+
+        cv.create_line(selected_x, meta['top'], selected_x, meta['bottom'],
+                       fill='#cbd5e1', width=1, dash=(4, 4), tags='measurement_cursor')
+        for key, (plot_top, lane_height, low, high, unit, color) in meta['lanes'].items():
+            yy = plot_top + (high - sample[key]) / (high - low) * lane_height
+            cv.create_oval(selected_x - 4, yy - 4, selected_x + 4, yy + 4,
+                           fill=color, outline=PANEL, width=2,
+                           tags='measurement_cursor')
+            cv.itemconfigure(f'value_{key}', text=f'{sample[key]:.3f} {unit}')
+        stamp = datetime.fromtimestamp(sample['time']).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        self.cursor_text.set(f'Cursor: {stamp}')
 
     def save_png(self):
         if Image is None:
@@ -844,8 +945,11 @@ class GraphsDialog(tk.Toplevel):
                 _, x, y, radius, color = item
                 drawer.ellipse((round((x-radius)*scale), round((y-radius)*scale),
                                 round((x+radius)*scale), round((y+radius)*scale)), fill=color)
-            elif item[0] == 'text':
-                _, x, y, msg, color, align, size = item
+            elif item[0] in ('text', 'value'):
+                if item[0] == 'value':
+                    _, _key, x, y, msg, color, align, size = item
+                else:
+                    _, x, y, msg, color, align, size = item
                 if size not in fonts:
                     font = None
                     for family in ('segoeui.ttf', 'DejaVuSans.ttf'):
@@ -865,7 +969,8 @@ class GraphsDialog(tk.Toplevel):
 
     def close(self):
         self._render_stop.set()
-        for job in (self._refresh_job, self._redraw_job, self._result_job):
+        for job in (self._refresh_job, self._redraw_job,
+                    self._result_job, self._hover_job):
             if job is not None:
                 try:
                     self.after_cancel(job)
